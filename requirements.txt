@@ -1,0 +1,7 @@
+faster-whisper>=1.0.3
+soundcard>=0.4.3
+numpy<2
+deep-translator>=1.11.4
+
+# Optional: offline translation for non-English targets (use with --engine argos)
+# argostranslate>=1.9.6
