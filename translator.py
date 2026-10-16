@@ -31,6 +31,7 @@ import time
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 LOG_FILE = os.path.join(APP_DIR, "translator.log")
+APP_VERSION = "v3"
 
 # When started with pythonw (no console) stdout/stderr are None -> log to a file
 if sys.stdout is None or sys.stderr is None:
@@ -265,8 +266,8 @@ def get_model(cfg, log):
 # Engine: capture -> streaming speech recognition -> (translate) -> UI queue
 # --------------------------------------------------------------------------- #
 class Engine:
-    def __init__(self, cfg, ui_q):
-        self.cfg, self.ui_q = cfg, ui_q
+    def __init__(self, cfg, ui_q, device=None):
+        self.cfg, self.ui_q, self.device = cfg, ui_q, device
         self.stop = threading.Event()
         self.thread = None
 
@@ -286,13 +287,17 @@ class Engine:
     # ---- capture ----
     def _capture(self, audio_q):
         try:
-            device = pick_capture_device(self.cfg["audio_device"])
+            device = self.device or pick_capture_device(self.cfg["audio_device"])
             self.log(f"Capturing audio from: {device.name}")
             frames = int(CAPTURE_SR * BLOCK_SEC)
             factor = CAPTURE_SR // WHISPER_SR
             with device.recorder(samplerate=CAPTURE_SR, channels=2) as rec:
+                first = True
                 while not self.stop.is_set():
                     data = rec.record(numframes=frames)
+                    if first:
+                        first = False
+                        self.log("Audio stream started.")
                     mono = data.mean(axis=1).astype(np.float32)
                     n = (len(mono) // factor) * factor
                     audio_q.put(mono[:n].reshape(-1, factor).mean(axis=1))
@@ -370,6 +375,9 @@ class Engine:
         buf, voiced, silence, total = [], 0.0, 0.0, 0.0
         sticky = None
         last_decode = 0.0
+        last_level, last_hint = 0.0, 0.0
+        last_sound, warned_silent = time.time(), False
+        announced = False
 
         def decode(audio, final):
             nonlocal sticky
@@ -398,7 +406,18 @@ class Engine:
                 continue
 
             dur = len(block) / WHISPER_SR
-            speech = float(np.sqrt(np.mean(block ** 2))) > threshold
+            rms = float(np.sqrt(np.mean(block ** 2)))
+            speech = rms > threshold
+            now_t = time.time()
+            if now_t - last_level >= 0.2:
+                last_level = now_t
+                self.ui_q.put(("level", rms, threshold))
+            if rms > 0.0003:
+                last_sound, warned_silent = now_t, False
+            elif now_t - last_sound > 8 and not warned_silent:
+                warned_silent = True
+                self.log("No sound is reaching the capture device. Play something through your "
+                         "speakers/headphones, or choose the right 'Audio source'.")
             buf.append(block)
             total += dur
             if speech:
@@ -406,6 +425,9 @@ class Engine:
                 silence = 0.0
             else:
                 silence += dur
+            if voiced >= 0.4 and not announced:
+                announced = True
+                self.log("Speech detected - recognizing...")
 
             if voiced == 0:
                 while total > 0.5 and len(buf) > 1:      # keep short pre-roll only
@@ -414,10 +436,15 @@ class Engine:
 
             if (voiced >= 0.3 and silence >= pause) or total >= max_seg:
                 audio = np.concatenate(buf)
+                heard = voiced
                 buf, voiced, silence, total = [], 0.0, 0.0, 0.0
                 text, lang = decode(audio, True)
                 emit("final", text, lang)             # empty text clears the live line
                 last_decode = time.time()
+                if not text and heard >= 1.0 and time.time() - last_hint > 6:
+                    last_hint = time.time()
+                    self.log("Heard sound but no clear speech (music/effects?). "
+                             "Try raising the Noise filter.")
             elif (update > 0 and voiced >= 0.4 and silence < pause
                   and time.time() - last_decode >= update and audio_q.qsize() <= 2):
                 text, lang = decode(np.concatenate(buf), False)
@@ -516,6 +543,7 @@ class Overlay:
             if not self.visible:
                 self.top.deiconify()
                 self.visible = True
+            self.top.attributes("-topmost", True)
             self.top.lift()
         elif self.visible:
             self.top.withdraw()
@@ -541,9 +569,9 @@ class App:
         self.engine = None
         self.running = False
 
-        root.title("Live Translator")
-        root.geometry("580x800")
-        root.minsize(540, 720)
+        root.title(f"Live Translator {APP_VERSION}")
+        root.geometry(f"580x{min(820, root.winfo_screenheight() - 90)}")
+        root.minsize(540, 560)
         root.configure(bg=self.BG)
         self._style()
         self.overlay = Overlay(root)
@@ -606,12 +634,58 @@ class App:
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True, padx=16, pady=12)
 
-        ttk.Label(outer, text="Live Translator", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(outer, text=f"Live Translator  {APP_VERSION}", style="Title.TLabel").pack(anchor="w")
         ttk.Label(outer, text="Real-time subtitles for any audio playing on your PC",
-                  style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 6))
+
+        # ---- controls: always visible at the top ----
+        self.btn = ttk.Button(outer, text="Start", style="Start.TButton", command=self.toggle)
+        self.btn.pack(fill="x", pady=(2, 4))
+        self.status = ttk.Label(outer, text="Idle", style="Status.TLabel")
+        self.status.pack(anchor="w")
+
+        lv = ttk.Frame(outer)
+        lv.pack(fill="x", pady=(6, 0))
+        ttk.Label(lv, text="Audio level", style="Status.TLabel").pack(side="left")
+        self.level = ttk.Progressbar(lv, maximum=100, length=220)
+        self.level.pack(side="left", padx=8)
+        self.level_lbl = ttk.Label(lv, text="-", style="Status.TLabel")
+        self.level_lbl.pack(side="left")
+
+        self.preview = tk.Label(outer, text="Live preview: subtitles also show here",
+                                bg="#0f1116", fg=self.MUTED, font=("Segoe UI", 13, "bold"),
+                                wraplength=500, height=3, justify="center")
+        self.preview.pack(fill="x", pady=(6, 0))
+
+        # ---- log: reserved at the bottom ----
+        lf = tk.Frame(outer, bg=self.BG)
+        lf.pack(side="bottom", fill="x", pady=(8, 0))
+        self.log = tk.Text(lf, height=7, bg="#0f1116", fg=self.FG, relief="flat", wrap="word",
+                           font=("Consolas", 10), state="disabled", padx=8, pady=6)
+        sb = ttk.Scrollbar(lf, command=self.log.yview)
+        self.log.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="x", expand=True)
+
+        # ---- settings: scrollable middle area ----
+        wrap = tk.Frame(outer, bg=self.BG)
+        wrap.pack(fill="both", expand=True, pady=(8, 0))
+        canvas = tk.Canvas(wrap, bg=self.BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        # mouse wheel scrolls the settings (and no longer flips dropdown values)
+        self.root.bind_class("TCombobox", "<MouseWheel>", lambda e: None)
+        self.root.bind_class("TSpinbox", "<MouseWheel>", lambda e: None)
+        self.root.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         # Language
-        f1 = ttk.LabelFrame(outer, text=" Language ", style="Panel.TLabelframe")
+        f1 = ttk.LabelFrame(inner, text=" Language ", style="Panel.TLabelframe")
         f1.pack(fill="x", pady=5)
         f1.columnconfigure(1, weight=1)
         self.v_target = tk.StringVar(value=c["target"] if c["target"] in TARGET_LANGS else "English")
@@ -622,7 +696,7 @@ class App:
         ttk.Label(f1, text="").grid(row=3, column=0, pady=2)
 
         # Speed
-        f2 = ttk.LabelFrame(outer, text=" Speed & accuracy ", style="Panel.TLabelframe")
+        f2 = ttk.LabelFrame(inner, text=" Speed & accuracy ", style="Panel.TLabelframe")
         f2.pack(fill="x", pady=5)
         f2.columnconfigure(1, weight=1)
         self.v_latency = tk.StringVar(value=c["latency"] if c["latency"] in LATENCY_PRESETS else DEFAULT_SETTINGS["latency"])
@@ -639,7 +713,7 @@ class App:
         ttk.Label(f2, text="").grid(row=7, column=0, pady=2)
 
         # Appearance
-        f3 = ttk.LabelFrame(outer, text=" Subtitle appearance ", style="Panel.TLabelframe")
+        f3 = ttk.LabelFrame(inner, text=" Subtitle appearance ", style="Panel.TLabelframe")
         f3.pack(fill="x", pady=5)
         f3.columnconfigure(1, weight=1)
         self.v_font = tk.IntVar(value=int(c["font"]))
@@ -649,7 +723,6 @@ class App:
         ttk.Spinbox(f3, from_=14, to=72, textvariable=self.v_font, width=6,
                     command=self._apply_appearance).grid(row=0, column=1, sticky="w", pady=(8, 0))
         self._combo(f3, 1, "Position", self.v_pos, POSITIONS, width=12)
-        self.v_pos_cb = None
         ttk.Label(f3, text="Background opacity").grid(row=2, column=0, sticky="w", padx=(12, 8), pady=(8, 0))
         ttk.Scale(f3, from_=30, to=100, variable=self.v_opacity, orient="horizontal",
                   command=lambda _=None: self._apply_appearance()).grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
@@ -661,7 +734,7 @@ class App:
         self.v_pos.trace_add("write", lambda *_: self._apply_appearance())
 
         # Audio
-        f4 = ttk.LabelFrame(outer, text=" Audio ", style="Panel.TLabelframe")
+        f4 = ttk.LabelFrame(inner, text=" Audio ", style="Panel.TLabelframe")
         f4.pack(fill="x", pady=5)
         f4.columnconfigure(1, weight=1)
         devs = [DEFAULT_AUDIO] + list_capture_devices()
@@ -675,24 +748,8 @@ class App:
         ttk.Label(f4, text="Raise if music/effects cause false subtitles; lower if speech is missed.",
                   style="Muted.TLabel", wraplength=330, justify="left").grid(
             row=3, column=1, sticky="w", padx=(0, 12), pady=(0, 10))
-
-        # Start / status
-        self.btn = ttk.Button(outer, text="Start", style="Start.TButton", command=self.toggle)
-        self.btn.pack(fill="x", pady=(10, 4))
-        self.status = ttk.Label(outer, text="Idle", style="Status.TLabel")
-        self.status.pack(anchor="w")
-        ttk.Label(outer, text="Language, speed and audio changes apply the next time you press Start.",
-                  style="Sub.TLabel", font=("Segoe UI", 8)).pack(anchor="w")
-
-        # Log
-        lf = tk.Frame(outer, bg=self.BG)
-        lf.pack(fill="both", expand=True, pady=(6, 0))
-        self.log = tk.Text(lf, height=6, bg="#0f1116", fg=self.FG, relief="flat", wrap="word",
-                           font=("Consolas", 10), state="disabled", padx=8, pady=6)
-        sb = ttk.Scrollbar(lf, command=self.log.yview)
-        self.log.config(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
+        ttk.Label(inner, text="Language, speed and audio changes apply the next time you press Start.",
+                  style="Sub.TLabel", font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 8))
 
     # ---- helpers ----
     def collect_cfg(self):
@@ -720,6 +777,7 @@ class App:
     def test_subtitle(self):
         self._apply_appearance()
         self.overlay.commit("This is how your subtitles will look.")
+        self.preview.config(text="This is how your subtitles will look.", fg="white")
 
     def add_log(self, text):
         self.log.config(state="normal")
@@ -742,8 +800,14 @@ class App:
 
     def start_engine(self):
         cfg = self.collect_cfg()
+        try:
+            device = pick_capture_device(cfg["audio_device"])
+        except Exception as e:
+            messagebox.showerror("Live Translator", f"Could not open the audio device:\n{e}")
+            self.add_log(f"ERROR: could not open audio device: {e}")
+            return
         self.overlay.clear()
-        self.engine = Engine(cfg, self.ui_q)
+        self.engine = Engine(cfg, self.ui_q, device)
         self.running = True
         self.btn.config(text="Stop", style="Stop.TButton")
         self.set_status("Starting...", self.ACCENT)
@@ -761,37 +825,59 @@ class App:
         self.btn.config(state="normal", text="Start", style="Start.TButton")
         if not self.status.cget("text").startswith("Error"):
             self.set_status("Idle")
+        self.level["value"] = 0
+        self.level_lbl.config(text="-", foreground=self.MUTED)
         self.overlay.clear()
 
     # ---- event pump ----
     def poll(self):
         try:
             while True:
-                msg = self.ui_q.get_nowait()
-                kind = msg[0]
-                if kind == "sub":
-                    _, k, text = msg
-                    if k == "partial":
-                        self.overlay.partial(text)
-                    else:
-                        self.overlay.commit(text)
-                        if text:
-                            self.add_log(time.strftime("%H:%M:%S  ") + text)
-                elif kind == "status":
-                    self.set_status(msg[1], self.GOOD if msg[1].startswith("Listening") else self.ACCENT)
-                elif kind == "log":
-                    self.add_log(msg[1])
-                elif kind == "error":
-                    self.add_log("ERROR: " + msg[1])
-                    self.set_status("Error - see log", self.BAD)
-                    if self.running:
-                        messagebox.showerror("Live Translator", msg[1])
-                elif kind == "stopped":
-                    self._finished()
-        except queue.Empty:
-            pass
-        self.overlay.tick()
-        self.root.after(30, self.poll)
+                try:
+                    msg = self.ui_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle(msg)
+                except Exception as e:           # one bad message must not stop the pump
+                    traceback.print_exc()
+                    self.add_log(f"UI error: {type(e).__name__}: {e}")
+            self.overlay.tick()
+        except Exception as e:
+            traceback.print_exc()
+        finally:
+            self.root.after(30, self.poll)
+
+    def _handle(self, msg):
+        kind = msg[0]
+        if kind == "sub":
+            _, k, text = msg
+            if text:
+                self.preview.config(text=text, fg="white")
+            if k == "partial":
+                self.overlay.partial(text)
+            else:
+                self.overlay.commit(text)
+                if text:
+                    self.add_log(time.strftime("%H:%M:%S  ") + text)
+        elif kind == "level":
+            _, rms, thr = msg
+            self.level["value"] = min(100.0, rms / 0.05 * 100.0)
+            if rms > thr:
+                self.level_lbl.config(text="hearing sound", foreground=self.GOOD)
+            else:
+                self.level_lbl.config(text="quiet", foreground=self.MUTED)
+        elif kind == "status":
+            self.set_status(msg[1], self.GOOD if msg[1].startswith("Listening") else self.ACCENT)
+        elif kind == "log":
+            self.add_log(msg[1])
+        elif kind == "error":
+            self.add_log("ERROR: " + msg[1])
+            self.set_status("Error - see log", self.BAD)
+            if self.running:
+                messagebox.showerror("Live Translator", msg[1])
+        elif kind == "stopped":
+            self._finished()
 
     def _on_tk_error(self, exc, val, tb):
         traceback.print_exception(exc, val, tb)
